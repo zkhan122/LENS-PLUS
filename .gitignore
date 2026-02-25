@@ -1,0 +1,16 @@
+.DS_Store
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+api/.venv/
+
+# Node
+node_modules/
+web/node_modules/
+web/dist/
+web/certs/
