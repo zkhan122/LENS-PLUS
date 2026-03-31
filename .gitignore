@@ -8,6 +8,7 @@ __pycache__/
 *.pyd
 *.log
 api/.venv/
+venv/
 
 # Node
 node_modules/
