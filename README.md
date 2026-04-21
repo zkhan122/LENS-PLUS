@@ -49,9 +49,9 @@ Default `.env.example`:
 
 ```bash
 VITE_SIGNALING_BASE_URL=http://localhost:8000
-SNAPSHOT_INTERVAL_SECONDS=0.1
+SNAPSHOT_INTERVAL_SECONDS=0.05
 SNAPSHOT_JPEG_QUALITY=92
-ANALYSIS_TARGET_FPS=5
+ANALYSIS_TARGET_FPS=15
 ```
 
 `ANALYSIS_TARGET_FPS` controls server-side processing cadence and is clamped to `1..30`.
@@ -65,7 +65,7 @@ For HTTPS + Docker phone testing, use `/api` for signaling and set `VITE_API_PRO
 
 For better detection quality from backend snapshots, keep:
 
-- `SNAPSHOT_INTERVAL_SECONDS` around `0.1` (about 10 FPS snapshots)
+- `SNAPSHOT_INTERVAL_SECONDS` around `0.05` (about 20 FPS snapshots)
 - `SNAPSHOT_JPEG_QUALITY` around `90-95`
 
 ## Quick start (Docker)

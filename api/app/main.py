@@ -45,7 +45,7 @@ class IceResponse(BaseModel):
     ok: bool
 
 
-DEFAULT_ANALYSIS_TARGET_FPS = 5.0
+DEFAULT_ANALYSIS_TARGET_FPS = 15.0
 MIN_ANALYSIS_TARGET_FPS = 1.0
 MAX_ANALYSIS_TARGET_FPS = 30.0
 FPS_WINDOW_SECONDS = 1.0
@@ -143,7 +143,7 @@ def read_int_env(name: str, default: int) -> int:
         return default
 
 
-SNAPSHOT_INTERVAL_SECONDS = max(0.03, read_float_env("SNAPSHOT_INTERVAL_SECONDS", 0.1))
+SNAPSHOT_INTERVAL_SECONDS = max(0.03, read_float_env("SNAPSHOT_INTERVAL_SECONDS", 0.05))
 SNAPSHOT_JPEG_QUALITY = min(95, max(60, read_int_env("SNAPSHOT_JPEG_QUALITY", 92)))
 
 

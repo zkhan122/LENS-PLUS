@@ -1,0 +1,39 @@
+{
+  "predictions": [
+    {
+      "image_id": "img-001",
+      "label": "person",
+      "bbox": [10, 10, 110, 200],
+      "score": 0.94
+    },
+    {
+      "image_id": "img-001",
+      "label": "chair",
+      "bbox": [130, 50, 220, 190],
+      "score": 0.81
+    },
+    {
+      "image_id": "img-002",
+      "label": "person",
+      "bbox": [20, 20, 120, 220],
+      "score": 0.88
+    }
+  ],
+  "ground_truths": [
+    {
+      "image_id": "img-001",
+      "label": "person",
+      "bbox": [12, 12, 108, 198]
+    },
+    {
+      "image_id": "img-001",
+      "label": "chair",
+      "bbox": [128, 48, 223, 191]
+    },
+    {
+      "image_id": "img-002",
+      "label": "person",
+      "bbox": [18, 22, 118, 222]
+    }
+  ]
+}
