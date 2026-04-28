@@ -53,7 +53,7 @@ SESSION_MANIFEST_FILENAME = "session.json"
 MAX_DIRECTIONAL_SAMPLE_AGE_MS = 5000
 
 # grouping frames feature
-GROUP_SESSION_TIME_CUT = 30 # seconds
+GROUP_SESSION_TIME_CUT = 10 # seconds
 
 
 def clamp_analysis_fps(value: float) -> float:
