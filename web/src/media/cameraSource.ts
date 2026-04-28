@@ -12,8 +12,8 @@ export async function startCameraStream(targetFramerate = 15): Promise<MediaStre
   }
 
   const viewportIsPortrait = window.matchMedia("(orientation: portrait)").matches;
-  const idealWidth = viewportIsPortrait ? 720 : 1280;
-  const idealHeight = viewportIsPortrait ? 1280 : 720;
+  const idealWidth = viewportIsPortrait ? 1080 : 1920;
+  const idealHeight = viewportIsPortrait ? 1920 : 1080;
   const idealAspectRatio = viewportIsPortrait ? 9 / 16 : 16 / 9;
 
   const videoConstraints: MediaTrackConstraints = {
