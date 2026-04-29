@@ -5,7 +5,9 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - ANALYSIS_TARGET_FPS=${ANALYSIS_TARGET_FPS:-5}
+      - SNAPSHOT_INTERVAL_SECONDS=${SNAPSHOT_INTERVAL_SECONDS:-0.05}
+      - SNAPSHOT_JPEG_QUALITY=${SNAPSHOT_JPEG_QUALITY:-92}
+      - ANALYSIS_TARGET_FPS=${ANALYSIS_TARGET_FPS:-15}
     volumes:
       - ./api/app:/app/app
     healthcheck:

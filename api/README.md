@@ -34,7 +34,7 @@ http://localhost:8000/health
 
 ## Environment variables
 
-- `ANALYSIS_TARGET_FPS` (default: `5`)
+- `ANALYSIS_TARGET_FPS` (default: `15`)
   - Controls server-side frame processing rate.
   - This is the only source of truth for analysis cadence.
   - Value is clamped to `1..30`.
@@ -45,14 +45,141 @@ http://localhost:8000/health
 Examples:
 
 ```bash
-ANALYSIS_TARGET_FPS=8 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+ANALYSIS_TARGET_FPS=15 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 With Docker Compose (root `docker-compose.yml`), this value is passed into the `api` container via:
 
 ```yaml
-ANALYSIS_TARGET_FPS=${ANALYSIS_TARGET_FPS:-5}
+ANALYSIS_TARGET_FPS=${ANALYSIS_TARGET_FPS:-15}
 ```
+
+## Evaluation and tests
+
+The evaluation helpers live here:
+
+- `app/evaluation/iou.py`
+- `app/evaluation/detection_metrics.py`
+- `app/evaluation/segmentation_metrics.py`
+
+To run the full test suite:
+
+```bash
+cd api
+python -m unittest discover -s tests -v
+```
+
+The tests cover:
+
+- IoU math (`xyxy` and `xywh`)
+- precision / recall / F1 at IoU thresholds
+- class-aware and class-agnostic matching
+- per-class metrics and confusion matrix
+- `mAP@0.5` and `mAP@0.5:0.95`
+- segmentation metrics (`Dice`, pixel accuracy, mask IoU, multiclass mIoU)
+- API integration and common failure paths
+
+If you want to run the benchmark/evaluation scripts, install the extra deps:
+
+```bash
+cd api
+pip install -r requirements-dev.txt
+```
+
+### Detection report (IoU/F1/mAP/per-class/confusion)
+
+Sample input: `examples/detection_eval_sample.json`
+
+```bash
+cd api
+python scripts/run_detection_eval.py --input examples/detection_eval_sample.json
+```
+
+Save report:
+
+```bash
+python scripts/run_detection_eval.py --input examples/detection_eval_sample.json --output reports/detection_metrics.json
+```
+
+### Segmentation report (Dice / Pixel Accuracy / mIoU)
+
+Sample input: `examples/segmentation_eval_sample.json`
+
+```bash
+cd api
+python scripts/run_segmentation_eval.py --input examples/segmentation_eval_sample.json
+```
+
+Save report:
+
+```bash
+python scripts/run_segmentation_eval.py --input examples/segmentation_eval_sample.json --output reports/segmentation_metrics.json
+```
+
+### Latency and FPS benchmark
+
+```bash
+cd api
+python scripts/run_latency_benchmark.py --model ../yolo11n.pt --source 0 --frames 120 --warmup 20
+```
+
+`--source` examples:
+
+- webcam: `0`
+- video file: `../some_clip.mp4`
+- backend snapshot URL: `http://localhost:8000/debug/sessions/<session_id>/latest.jpg`
+
+### Robustness evaluation (blur / brightness / contrast / jpeg artifacts / noise)
+
+Input JSON format:
+
+```json
+{
+  "images": [
+    {
+      "image_id": "img-001",
+      "path": "C:/path/to/image.jpg",
+      "ground_truths": [
+        { "label": "person", "bbox": [10, 20, 130, 260] }
+      ]
+    }
+  ]
+}
+```
+
+Run:
+
+```bash
+cd api
+python scripts/run_robustness_eval.py --model ../yolo11n.pt --input C:/path/to/robustness_dataset.json --output reports/robustness_report.json
+```
+
+### Regression check
+
+Compare current metrics with a baseline:
+
+```bash
+cd api
+python scripts/run_regression_check.py --baseline reports/baseline_detection_metrics.json --current reports/current_detection_metrics.json --max-map50-drop 0.02 --max-map5095-drop 0.02
+```
+
+Set minimum required thresholds:
+
+```bash
+python scripts/run_regression_check.py --current reports/current_detection_metrics.json --min-map50 0.40 --min-map5095 0.20
+```
+
+### API integration and failure-path tests
+
+`tests/test_api_integration.py` checks:
+
+- `/health`
+- `/debug/sessions`
+- `/debug/sessions/history`
+- unknown session snapshot returns `404`
+- no-snapshot-yet returns `404`
+- unknown ICE session returns `404`
+- malformed offer payload returns `422`
 
 ## API contract
 
@@ -133,7 +260,18 @@ In `api/app/main.py`, each video frame is received in `consume_frames()`.
 Every session creates:
 
 - `frame-*.jpg` files for each processed frame
-- `session.json` metadata with counters, timestamps, and dump status
+- `frame-*.json` metadata for each processed frame
+- `session.json` metadata with counters, timestamps, dump status, and latest detection state
+
+`frame-*.json` includes:
+
+- `frame_id` / `frame_index`
+- `frame_at`
+- `directional` context (if available)
+- `detections`:
+  - `objects` (label, confidence, bbox)
+  - `metrics` (`num_detections`, `avg_confidence`, `max_confidence`, `min_confidence`)
+  - inference timestamp and staleness (`age_ms`, `is_stale`)
 
 `app/session_artifacts/` is ignored by git and excluded from Docker build context.
 

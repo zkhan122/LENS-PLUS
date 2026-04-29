@@ -18,7 +18,7 @@ from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.sdp import candidate_from_sdp
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel
 
 
@@ -45,14 +45,13 @@ class IceResponse(BaseModel):
     ok: bool
 
 
-DEFAULT_ANALYSIS_TARGET_FPS = 5.0
+DEFAULT_ANALYSIS_TARGET_FPS = 15.0
 MIN_ANALYSIS_TARGET_FPS = 1.0
 MAX_ANALYSIS_TARGET_FPS = 30.0
 FPS_WINDOW_SECONDS = 1.0
 SESSION_MANIFEST_FILENAME = "session.json"
+MAX_INFERENCE_SAMPLE_AGE_MS = 3000
 MAX_DIRECTIONAL_SAMPLE_AGE_MS = 5000
-
-# grouping frames feature
 GROUP_SESSION_TIME_CUT = 10 # seconds
 
 
@@ -119,6 +118,10 @@ class Session:
     latest_directional_received_at: datetime | None = None
     latest_directional_client_timestamp_ms: int | None = None
     latest_processed_directional: dict[str, Any] | None = None
+    inference_messages_emitted: int = 0
+    latest_inference_payload: dict[str, Any] | None = None
+    latest_inference_at: datetime | None = None
+    latest_processed_detections: dict[str, Any] | None = None
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -132,6 +135,30 @@ app.add_middleware(
 )
 
 sessions: dict[str, Session] = {}
+
+
+def read_float_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def read_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+SNAPSHOT_INTERVAL_SECONDS = max(0.03, read_float_env("SNAPSHOT_INTERVAL_SECONDS", 0.05))
+SNAPSHOT_JPEG_QUALITY = min(95, max(60, read_int_env("SNAPSHOT_JPEG_QUALITY", 92)))
 
 
 @app.on_event("startup")
@@ -201,6 +228,13 @@ async def debug_sessions() -> dict[str, list[dict[str, Any]]]:
                     session.latest_directional_client_timestamp_ms
                 ),
                 "latest_processed_directional": session.latest_processed_directional,
+                "inference_messages_emitted": session.inference_messages_emitted,
+                "latest_inference_at": (
+                    session.latest_inference_at.isoformat()
+                    if session.latest_inference_at
+                    else None
+                ),
+                "latest_processed_detections": session.latest_processed_detections,
                 "updated_at": session.updated_at.isoformat(),
             }
         )
@@ -295,6 +329,25 @@ async def offer(payload: OfferRequest) -> OfferResponse:
                     session.updated_at = now
                     window_incoming_frames += 1
 
+                    snapshot_due = (
+                        (now - last_snapshot_at).total_seconds()
+                        >= SNAPSHOT_INTERVAL_SECONDS
+                    )
+                    snapshot_jpeg: bytes | None = None
+                    snapshot_error: str | None = None
+                    if snapshot_due:
+                        snapshot_jpeg, snapshot_error = frame_to_jpeg(
+                            frame, jpeg_quality=SNAPSHOT_JPEG_QUALITY
+                        )
+                        if snapshot_jpeg:
+                            session.latest_jpeg = snapshot_jpeg
+                            session.latest_jpeg_at = now
+                            last_snapshot_at = now
+                            session.last_snapshot_error = None
+                        else:
+                            session.snapshot_errors += 1
+                            session.last_snapshot_error = snapshot_error
+
                     target_analysis_fps = clamp_analysis_fps(
                         session.analysis_target_fps
                     )
@@ -313,24 +366,32 @@ async def offer(payload: OfferRequest) -> OfferResponse:
                         frame_at=now,
                     )
                     session.latest_processed_directional = directional_context
+                    detection_context = build_detection_context_for_frame(
+                        session=session,
+                        frame_at=now,
+                    )
+                    session.latest_processed_detections = detection_context
 
-                    frame_jpeg, frame_jpeg_error = frame_to_jpeg(frame)
-                    if frame_jpeg:
-                        persist_processed_frame(
-                            session=session,
-                            frame_jpeg=frame_jpeg,
-                            frame_at=now,
-                            directional_context=directional_context,
+                    processed_frame_jpeg = snapshot_jpeg
+                    processed_frame_error = snapshot_error
+                    if processed_frame_jpeg is None:
+                        processed_frame_jpeg, processed_frame_error = frame_to_jpeg(
+                            frame, jpeg_quality=SNAPSHOT_JPEG_QUALITY
                         )
 
-                        if (now - last_snapshot_at).total_seconds() >= 0.5:
-                            session.latest_jpeg = frame_jpeg
-                            session.latest_jpeg_at = now
-                            last_snapshot_at = now
-                            session.last_snapshot_error = None
+                    if processed_frame_jpeg:
+                        persist_processed_frame(
+                            session=session,
+                            frame_jpeg=processed_frame_jpeg,
+                            frame_at=now,
+                            directional_context=directional_context,
+                            detection_context=detection_context,
+                        )
                     else:
-                        session.snapshot_errors += 1
-                        session.last_snapshot_error = frame_jpeg_error
+                        session.dump_errors += 1
+                        session.last_dump_error = (
+                            f"processed frame encode failed: {processed_frame_error}"
+                        )
 
                     update_fps_window(now_mono)
                 except Exception:
@@ -428,6 +489,8 @@ async def send_mock_results(session: Session) -> None:
 
         try:
             channel.send(json.dumps(payload))
+            update_latest_inference(session=session, payload=payload)
+            session.inference_messages_emitted += 1
             session.updated_at = datetime.now(timezone.utc)
         except Exception:
             break
@@ -570,6 +633,101 @@ def build_directional_context_for_frame(
     }
 
 
+def update_latest_inference(session: Session, payload: dict[str, Any]) -> None:
+    now = datetime.now(timezone.utc)
+    session.latest_inference_payload = payload
+    session.latest_inference_at = now
+
+
+def normalize_inference_objects(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_objects = payload.get("objects")
+    if not isinstance(raw_objects, list):
+        return []
+
+    normalized_objects: list[dict[str, Any]] = []
+    for raw_obj in raw_objects:
+        if not isinstance(raw_obj, dict):
+            continue
+        label = raw_obj.get("label")
+        confidence = raw_obj.get("confidence")
+        bbox = raw_obj.get("bbox")
+        if not isinstance(label, str):
+            continue
+        confidence_value = None
+        if isinstance(confidence, (int, float)) and math.isfinite(confidence):
+            confidence_value = float(confidence)
+
+        normalized_bbox = None
+        if isinstance(bbox, list) and len(bbox) == 4:
+            parsed_bbox: list[float] = []
+            for value in bbox:
+                if isinstance(value, (int, float)) and math.isfinite(value):
+                    parsed_bbox.append(float(value))
+            if len(parsed_bbox) == 4:
+                normalized_bbox = parsed_bbox
+
+        normalized_objects.append(
+            {
+                "label": label,
+                "confidence": confidence_value,
+                "bbox": normalized_bbox,
+            }
+        )
+    return normalized_objects
+
+
+def build_detection_context_for_frame(
+    session: Session,
+    frame_at: datetime,
+) -> dict[str, Any] | None:
+    payload = session.latest_inference_payload
+    inference_at = session.latest_inference_at
+    if payload is None or inference_at is None:
+        return {
+            "inference_timestamp": None,
+            "server_inference_received_at": None,
+            "age_ms": None,
+            "is_stale": True,
+            "scene_summary": None,
+            "guidance_text": None,
+            "objects": [],
+            "metrics": {
+                "num_detections": 0,
+                "num_with_confidence": 0,
+                "avg_confidence": None,
+                "max_confidence": None,
+                "min_confidence": None,
+            },
+        }
+
+    objects = normalize_inference_objects(payload)
+    confidences = [
+        item["confidence"] for item in objects if isinstance(item.get("confidence"), float)
+    ]
+    age_ms = max(0, int(round((frame_at - inference_at).total_seconds() * 1000)))
+
+    metrics = {
+        "num_detections": len(objects),
+        "num_with_confidence": len(confidences),
+        "avg_confidence": (
+            round(sum(confidences) / len(confidences), 4) if confidences else None
+        ),
+        "max_confidence": round(max(confidences), 4) if confidences else None,
+        "min_confidence": round(min(confidences), 4) if confidences else None,
+    }
+
+    return {
+        "inference_timestamp": payload.get("timestamp"),
+        "server_inference_received_at": inference_at.isoformat(),
+        "age_ms": age_ms,
+        "is_stale": age_ms > MAX_INFERENCE_SAMPLE_AGE_MS,
+        "scene_summary": payload.get("scene_summary"),
+        "guidance_text": payload.get("guidance_text"),
+        "objects": objects,
+        "metrics": metrics,
+    }
+
+
 async def close_session(session_id: str) -> None:
     session = sessions.pop(session_id, None)
     if not session:
@@ -653,55 +811,221 @@ def create_session_artifact(session_id: str, started_at: datetime) -> tuple[str 
     return artifact_id, artifact_dir, artifact_manifest_path, None
 
 
-GROUPED_SECONDS = 30 # should be grouped every 30 seconds
-
-def get_group_dir(artifact_dir: Path, started_at: datetime, frame_at: datetime):
-    elapsed_seconds = (frame_at - started_at).total_seconds()
-    group_number = int(elapsed_seconds // GROUPED_SECONDS) + 1
-    group_dir = artifact_dir / f"group-{group_number}"
+def get_group_dir(artifact_dir: Path, started_at: datetime, frame_at: datetime) -> Path:
+    elapsed_seconds = max(0.0, (frame_at - started_at).total_seconds())
+    group_number = int(elapsed_seconds // GROUP_SESSION_TIME_CUT_SECONDS) + 1
+    group_dir = artifact_dir / f"group-{group_number:03d}"
     group_dir.mkdir(parents=True, exist_ok=True)
     return group_dir
 
-def persist_processed_frame(session: Session, frame_jpeg: bytes, frame_at: datetime) -> None:
-    if session.artifact_dir is None:
-        return
 
-    if session.started_at is None:
-        session.last_dump_error = "frame dump failed: session.started_at is missing"
-        session.dump_errors += 1
-        return
+def coerce_bbox_list(value: Any) -> list[float] | None:
+    if not isinstance(value, list) or len(value) != 4:
+        return None
+
+    parsed: list[float] = []
+    for item in value:
+        if not isinstance(item, (int, float)) or not math.isfinite(item):
+            return None
+        parsed.append(float(item))
+    return parsed
+
+
+def clamp_pixel(value: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(maximum, value))
+
+
+def bbox_to_xyxy_pixels(
+    bbox: list[float], image_width: int, image_height: int
+) -> tuple[int, int, int, int] | None:
+    if image_width <= 0 or image_height <= 0:
+        return None
+
+    x, y, width, height = bbox
+
+    if all(0.0 <= value <= 1.0 for value in bbox):
+        left = int(round(x * image_width))
+        top = int(round(y * image_height))
+        right = int(round((x + width) * image_width))
+        bottom = int(round((y + height) * image_height))
+    else:
+        if width > x and height > y:
+            left = int(round(x))
+            top = int(round(y))
+            right = int(round(width))
+            bottom = int(round(height))
+        else:
+            left = int(round(x))
+            top = int(round(y))
+            right = int(round(x + width))
+            bottom = int(round(y + height))
+
+    max_x = max(0, image_width - 1)
+    max_y = max(0, image_height - 1)
+    left = clamp_pixel(left, 0, max_x)
+    top = clamp_pixel(top, 0, max_y)
+    right = clamp_pixel(right, 0, max_x)
+    bottom = clamp_pixel(bottom, 0, max_y)
+
+    if right <= left or bottom <= top:
+        return None
+
+    return left, top, right, bottom
+
+
+def select_primary_detected_object(
+    detected_objects: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not detected_objects:
+        return None
+
+    best_object = detected_objects[0]
+    best_confidence = (
+        best_object.get("confidence")
+        if isinstance(best_object.get("confidence"), float)
+        else -1.0
+    )
+    for candidate in detected_objects[1:]:
+        confidence = candidate.get("confidence")
+        if isinstance(confidence, float) and confidence > best_confidence:
+            best_object = candidate
+            best_confidence = confidence
+
+    return best_object
+
+
+def render_detection_overlay(
+    frame_jpeg: bytes,
+    detection_context: dict[str, Any] | None,
+) -> tuple[bytes, list[dict[str, Any]], str | None]:
+    if not isinstance(detection_context, dict):
+        return frame_jpeg, [], None
+
+    raw_objects = detection_context.get("objects")
+    if not isinstance(raw_objects, list) or not raw_objects:
+        return frame_jpeg, [], None
+
+    parsed_objects: list[dict[str, Any]] = []
+    for raw_obj in raw_objects:
+        if not isinstance(raw_obj, dict):
+            continue
+        label = raw_obj.get("label")
+        if not isinstance(label, str):
+            continue
+        confidence = raw_obj.get("confidence")
+        confidence_value = None
+        if isinstance(confidence, (int, float)) and math.isfinite(confidence):
+            confidence_value = float(confidence)
+        parsed_objects.append(
+            {
+                "label": label,
+                "confidence": confidence_value,
+                "bbox": coerce_bbox_list(raw_obj.get("bbox")),
+            }
+        )
+
+    if not parsed_objects:
+        return frame_jpeg, [], None
+
+    try:
+        image = Image.open(io.BytesIO(frame_jpeg)).convert("RGB")
+    except Exception as error:
+        return frame_jpeg, parsed_objects, f"overlay decode failed: {error}"
+
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    image_width, image_height = image.size
+    draw_color = (0, 220, 90)
+    drawn_any_box = False
+
+    for obj in parsed_objects:
+        bbox = obj.get("bbox")
+        if not isinstance(bbox, list):
+            continue
+
+        pixel_box = bbox_to_xyxy_pixels(bbox, image_width=image_width, image_height=image_height)
+        if pixel_box is None:
+            continue
+
+        x1, y1, x2, y2 = pixel_box
+        draw.rectangle((x1, y1, x2, y2), outline=draw_color, width=3)
+        confidence = obj.get("confidence")
+        if isinstance(confidence, float):
+            text = f"{obj['label']} {confidence:.2f}"
+        else:
+            text = obj["label"]
+
+        try:
+            text_left, text_top, text_right, text_bottom = draw.textbbox((0, 0), text, font=font)
+            text_width = max(1, text_right - text_left)
+            text_height = max(1, text_bottom - text_top)
+        except Exception:
+            text_width = max(1, int(len(text) * 7))
+            text_height = 12
+
+        text_x = x1
+        text_y = y1 - text_height - 6
+        if text_y < 0:
+            text_y = min(image_height - text_height - 1, y1 + 3)
+
+        bg_right = min(image_width - 1, text_x + text_width + 6)
+        bg_bottom = min(image_height - 1, text_y + text_height + 4)
+        draw.rectangle((text_x, text_y, bg_right, bg_bottom), fill=draw_color)
+        draw.text((text_x + 3, text_y + 1), text, fill=(0, 0, 0), font=font)
+        drawn_any_box = True
+
+    if not drawn_any_box:
+        return frame_jpeg, parsed_objects, None
+
+    try:
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=SNAPSHOT_JPEG_QUALITY)
+        return buffer.getvalue(), parsed_objects, None
+    except Exception as error:
+        return frame_jpeg, parsed_objects, f"overlay encode failed: {error}"
+
+
 def persist_processed_frame(
     session: Session,
     frame_jpeg: bytes,
     frame_at: datetime,
     directional_context: dict[str, Any] | None,
+    detection_context: dict[str, Any] | None,
 ) -> None:
     if session.artifact_dir is None:
         return
+
+    group_dir = get_group_dir(
+        artifact_dir=session.artifact_dir,
+        started_at=session.started_at,
+        frame_at=frame_at,
+    )
 
     frame_name = (
         f"frame-{session.processed_frames:06d}-"
         f"{frame_at.strftime('%Y%m%dT%H%M%S%fZ')}.jpg"
     )
-    frame_path = session.artifact_dir / frame_name
+    frame_path = group_dir / frame_name
     metadata_path = frame_path.with_suffix(".json")
+    elapsed_seconds = max(0.0, (frame_at - session.started_at).total_seconds())
+    group_number = int(elapsed_seconds // GROUP_SESSION_TIME_CUT_SECONDS) + 1
+    rendered_frame_jpeg, detected_objects, overlay_error = render_detection_overlay(
+        frame_jpeg=frame_jpeg,
+        detection_context=detection_context,
+    )
+    object_detected = select_primary_detected_object(detected_objects)
     frame_metadata = {
+        "frame_id": session.processed_frames,
         "frame_name": frame_name,
         "frame_index": session.processed_frames,
         "frame_at": frame_at.isoformat(),
+        "group_id": group_number,
+        "group_dir": group_dir.name,
         "directional": directional_context,
     }
 
     try:
-        group_dir = get_group_dir(session.artifact_dir, session.started_at, frame_at)
-
-        frame_name = (
-            f"frame-{session.processed_frames:06d}-"
-            f"{frame_at.strftime('%Y%m%dT%H%M%S%fZ')}.jpg"
-        )
-        frame_path = group_dir / frame_name
-        frame_path.write_bytes(frame_jpeg)
-
+        frame_path.write_bytes(rendered_frame_jpeg)
         metadata_path.write_text(json.dumps(frame_metadata, indent=2) + "\n")
         session.dumped_frames += 1
         session.last_dump_error = None
@@ -743,6 +1067,13 @@ def build_session_manifest(
             session.latest_directional_client_timestamp_ms
         ),
         "latest_processed_directional": session.latest_processed_directional,
+        "inference_messages_emitted": session.inference_messages_emitted,
+        "latest_inference_at": (
+            session.latest_inference_at.isoformat()
+            if session.latest_inference_at
+            else None
+        ),
+        "latest_processed_detections": session.latest_processed_detections,
         "latest_jpeg_at": (
             session.latest_jpeg_at.isoformat() if session.latest_jpeg_at else None
         ),
@@ -815,15 +1146,15 @@ def load_session_history(limit: int = 100) -> list[dict[str, Any]]:
         )
 
     return history
-
-
-def frame_to_jpeg(frame: Any) -> tuple[bytes | None, str | None]:
+def frame_to_jpeg(
+    frame: Any, jpeg_quality: int = SNAPSHOT_JPEG_QUALITY
+) -> tuple[bytes | None, str | None]:
     errors: list[str] = []
 
     try:
         image = frame.to_image()
         buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=75)
+        image.save(buffer, format="JPEG", quality=jpeg_quality)
         return buffer.getvalue(), None
     except Exception as error:
         errors.append(f"to_image failed: {error}")
@@ -832,7 +1163,7 @@ def frame_to_jpeg(frame: Any) -> tuple[bytes | None, str | None]:
         rgb = frame.to_ndarray(format="rgb24")
         image = Image.fromarray(rgb)
         buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=75)
+        image.save(buffer, format="JPEG", quality=jpeg_quality)
         return buffer.getvalue(), None
     except Exception as error:
         errors.append(f"rgb24 fallback failed: {error}")
@@ -841,7 +1172,7 @@ def frame_to_jpeg(frame: Any) -> tuple[bytes | None, str | None]:
         gray = frame.to_ndarray(format="gray")
         image = Image.fromarray(gray, mode="L")
         buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=75)
+        image.save(buffer, format="JPEG", quality=jpeg_quality)
         return buffer.getvalue(), None
     except Exception as error:
         errors.append(f"gray fallback failed: {error}")
