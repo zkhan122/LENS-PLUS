@@ -144,10 +144,10 @@ class FrameMetricsAccumulator:
 
 class DepthZoneAnalyser:
     ZONE_THRESHOLDS_M = { # proximity in metres away
-        "very_close": 0.6,
-        "close":      1.5,
-        "mid":        3.0,
-        "far":        6.0,
+        "very_close": 0.8,
+        "close":      2.0,
+        "mid":        4.0,
+        "far":        8.0,
     }
 
     NEAREST_PERCENTILE = 5.0
