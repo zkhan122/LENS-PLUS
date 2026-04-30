@@ -45,6 +45,13 @@ class IceResponse(BaseModel):
     ok: bool
 
 
+class InferenceIngestRequest(BaseModel):
+    timestamp: str | None = None
+    guidance_text: str | None = None
+    scene_summary: str | None = None
+    objects: list[dict[str, Any]] = []
+
+
 DEFAULT_ANALYSIS_TARGET_FPS = 15.0
 MIN_ANALYSIS_TARGET_FPS = 1.0
 MAX_ANALYSIS_TARGET_FPS = 30.0
@@ -52,10 +59,7 @@ FPS_WINDOW_SECONDS = 1.0
 SESSION_MANIFEST_FILENAME = "session.json"
 MAX_INFERENCE_SAMPLE_AGE_MS = 3000
 MAX_DIRECTIONAL_SAMPLE_AGE_MS = 5000
-GROUP_SESSION_TIME_CUT_SECONDS = 30
-
-# grouping frames feature
-GROUP_SESSION_TIME_CUT = 30 # seconds
+GROUP_SESSION_TIME_CUT_SECONDS = 10 # seconds
 
 
 def clamp_analysis_fps(value: float) -> float:
@@ -462,6 +466,35 @@ async def ice(payload: IceRequest) -> IceResponse:
     return IceResponse(ok=True)
 
 
+@app.post("/debug/sessions/{session_id}/inference", response_model=IceResponse)
+async def ingest_inference(
+    session_id: str,
+    payload: InferenceIngestRequest,
+) -> IceResponse:
+    session = sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Unknown session")
+
+    normalized_payload = {
+        "timestamp": payload.timestamp or datetime.now(timezone.utc).isoformat(),
+        "guidance_text": payload.guidance_text,
+        "scene_summary": payload.scene_summary,
+        "objects": payload.objects,
+    }
+
+    update_latest_inference(session=session, payload=normalized_payload)
+    session.inference_messages_emitted += 1
+    session.updated_at = datetime.now(timezone.utc)
+
+    # If external detections are being ingested, stop mock updates to avoid
+    # overwriting real detection state used by artifact dumps.
+    if session.mock_task is not None:
+        session.mock_task.cancel()
+        session.mock_task = None
+
+    return IceResponse(ok=True)
+
+
 async def send_mock_results(session: Session) -> None:
     object_labels = ["chair", "desk", "door", "bag", "keys", "person"]
     while True:
@@ -789,7 +822,9 @@ def sanitize_artifact_component(value: str) -> str:
     return sanitized or "session"
 
 
-def create_session_artifact(session_id: str, started_at: datetime) -> tuple[str | None, Path | None, Path | None, str | None]:
+def create_session_artifact(
+    session_id: str, started_at: datetime
+) -> tuple[str | None, Path | None, Path | None, str | None]:
     safe_session_id = sanitize_artifact_component(session_id)
     started_fragment = started_at.strftime("%Y%m%dT%H%M%S%fZ")
     artifact_id = f"{started_fragment}--{safe_session_id}"
@@ -798,8 +833,6 @@ def create_session_artifact(session_id: str, started_at: datetime) -> tuple[str 
 
     try:
         artifact_dir.mkdir(parents=True, exist_ok=False)
-
-    
     except FileExistsError:
         artifact_id = f"{artifact_id}--{uuid.uuid4().hex[:8]}"
         artifact_dir = SESSION_ARTIFACTS_ROOT / artifact_id
@@ -814,6 +847,7 @@ def create_session_artifact(session_id: str, started_at: datetime) -> tuple[str 
     return artifact_id, artifact_dir, artifact_manifest_path, None
 
 
+<<<<<<< HEAD
 GROUPED_SECONDS = 30 # should be grouped every 30 seconds
 
 
@@ -825,6 +859,8 @@ def persist_processed_frame(session: Session, frame_jpeg: bytes, frame_at: datet
         session.last_dump_error = "frame dump failed: session.started_at is missing"
         session.dump_errors += 1
         return
+=======
+>>>>>>> 50fbd1e89250ea2e92c478e530bab642a4a3717d
 def get_group_dir(artifact_dir: Path, started_at: datetime, frame_at: datetime) -> Path:
     elapsed_seconds = max(0.0, (frame_at - started_at).total_seconds())
     group_number = int(elapsed_seconds // GROUP_SESSION_TIME_CUT_SECONDS) + 1
@@ -1047,7 +1083,6 @@ def persist_processed_frame(
         metadata_path.write_text(json.dumps(frame_metadata, indent=2) + "\n")
         session.dumped_frames += 1
         session.last_dump_error = None
-
     except Exception as error:
         session.dump_errors += 1
         session.last_dump_error = f"frame dump failed: {error}"
